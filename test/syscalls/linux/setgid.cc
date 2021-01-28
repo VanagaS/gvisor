@@ -17,12 +17,18 @@
 #include <unistd.h>
 
 #include "gtest/gtest.h"
+#include "absl/flags/flag.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/fs_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+
+ABSL_FLAG(std::vector<std::string>, groups, std::vector<std::string>({}),
+          "groups the test can use");
+
+constexpr gid_t kGID = 65534;
 
 namespace gvisor {
 namespace testing {
@@ -46,6 +52,18 @@ PosixErrorOr<Cleanup> Setegid(gid_t egid) {
 
 // Returns a pair of groups that the user is a member of.
 PosixErrorOr<std::pair<gid_t, gid_t>> Groups() {
+  // Were we explicitly passed GIDs?
+  std::vector<std::string> flagged_groups = absl::GetFlag(FLAGS_groups);
+  if (flagged_groups.size() >= 2) {
+    int group1;
+    int group2;
+    if (!absl::SimpleAtoi(flagged_groups[0], &group1) ||
+        !absl::SimpleAtoi(flagged_groups[1], &group2)) {
+      return PosixError(EINVAL, "failed converting group flags to ints");
+    }
+    return std::pair<gid_t, gid_t>(group1, group2);
+  }
+
   // See whether the user is a member of at least 2 groups.
   std::vector<gid_t> groups(64);
   for (; groups.size() <= NGROUPS_MAX; groups.resize(groups.size() * 2)) {
@@ -67,17 +85,23 @@ PosixErrorOr<std::pair<gid_t, gid_t>> Groups() {
 
   // If we're root in the root user namespace, we can set our GID to whatever we
   // want. Try that before giving up.
-  constexpr gid_t kGID1 = 1111;
-  constexpr gid_t kGID2 = 2222;
-  auto cleanup1 = Setegid(kGID1);
+  PosixErrorOr<bool> capable = HaveCapability(CAP_SETGID);
+  if (!capable.ok()) {
+    return capable.error();
+  }
+  if (!capable.ValueOrDie()) {
+    return PosixError(EPERM, "missing CAP_SETGID");
+  }
+  gid_t gid = getegid();
+  auto cleanup1 = Setegid(gid);
   if (!cleanup1.ok()) {
     return cleanup1.error();
   }
-  auto cleanup2 = Setegid(kGID2);
+  auto cleanup2 = Setegid(kGID);
   if (!cleanup2.ok()) {
     return cleanup2.error();
   }
-  return std::pair<gid_t, gid_t>(kGID1, kGID2);
+  return std::pair<gid_t, gid_t>(gid, kGID);
 }
 
 class SetgidDirTest : public ::testing::Test {
@@ -85,13 +109,16 @@ class SetgidDirTest : public ::testing::Test {
   void SetUp() override {
     original_gid_ = getegid();
 
-    // TODO(b/175325250): Enable when setgid directories are supported.
     SKIP_IF(IsRunningWithVFS1());
-    SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
 
     temp_dir_ = ASSERT_NO_ERRNO_AND_VALUE(
         TempPath::CreateDirWith(GetAbsoluteTestTmpdir(), 0777 /* mode */));
-    groups_ = ASSERT_NO_ERRNO_AND_VALUE(Groups());
+
+    // If we can't find two usable groups, we're in an unsupporting environment.
+    // Skip the test.
+    PosixErrorOr<std::pair<gid_t, gid_t>> groups = Groups();
+    SKIP_IF(!groups.ok());
+    groups_ = groups.ValueOrDie();
   }
 
   void TearDown() override {
